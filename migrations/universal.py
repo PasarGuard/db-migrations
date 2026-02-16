@@ -1105,15 +1105,15 @@ class UniversalMigrator:
                 max_id = result.scalar()
                 return max_id if max_id is not None else 0
 
-    async def sync_alembic_version(self):
+    async def validate_alembic_version(self):
         """
-        Sync Alembic revision metadata from source to target when available.
+        Validate that source and target have matching Alembic migration versions.
 
-        This prevents target apps from replaying old migrations after a successful
-        data migration.
+        Exits with error if versions don't match, indicating structural differences
+        that must be resolved before migration can proceed.
         """
         if "alembic_version" in self.exclude_tables:
-            print("\n⊘ alembic_version sync skipped (excluded)")
+            print("\n⊘ alembic_version validation skipped (excluded)")
             return
 
         table_data = self.tables.get("alembic_version")
@@ -1131,7 +1131,7 @@ class UniversalMigrator:
             if "version_num" in lowered:
                 version_index = lowered.index("version_num")
 
-        versions = []
+        source_versions = []
         for row in rows:
             if not row or version_index >= len(row):
                 continue
@@ -1140,45 +1140,65 @@ class UniversalMigrator:
                 continue
             value = str(value).strip()
             if value:
-                versions.append(value)
+                source_versions.append(value)
 
-        versions = sorted(set(versions))
-        if not versions:
+        source_versions = sorted(set(source_versions))
+        if not source_versions:
             return
 
-        print("\nSyncing Alembic revision metadata...")
+        print("\nValidating Alembic migration versions...")
 
         quoted_table = self._quote_identifier("alembic_version", self.target_type)
         quoted_column = self._quote_identifier("version_num", self.target_type)
-        create_sql = (
-            f"CREATE TABLE IF NOT EXISTS {quoted_table} "
-            f"({quoted_column} VARCHAR(32) NOT NULL PRIMARY KEY)"
-        )
-        delete_sql = f"DELETE FROM {quoted_table}"
-        insert_sql = (
-            f"INSERT INTO {quoted_table} ({quoted_column}) VALUES (:version_num)"
-        )
 
+        target_versions = []
         try:
+            # Check if table exists and get versions
+            check_sql = f"SELECT {quoted_column} FROM {quoted_table}"
+
             if self.is_target_async:
                 async with self.session_maker() as session:
-                    await session.execute(text(create_sql))
-                    await session.execute(text(delete_sql))
-                    for version in versions:
-                        await session.execute(
-                            text(insert_sql), {"version_num": version}
-                        )
-                    await session.commit()
+                    result = await session.execute(text(check_sql))
+                    target_rows = result.fetchall()
+                    target_versions = [
+                        str(row[0]).strip() for row in target_rows if row[0]
+                    ]
             else:
-                with self.target_engine.begin() as conn:
-                    conn.execute(text(create_sql))
-                    conn.execute(text(delete_sql))
-                    for version in versions:
-                        conn.execute(text(insert_sql), {"version_num": version})
+                with self.target_engine.connect() as conn:
+                    result = conn.execute(text(check_sql))
+                    target_rows = result.fetchall()
+                    target_versions = [
+                        str(row[0]).strip() for row in target_rows if row[0]
+                    ]
 
-            print(f"  ✓ alembic_version: {', '.join(versions)}")
-        except Exception as e:
-            print(f"  ⚠ alembic_version sync failed: {str(e)[:120]}")
+            target_versions = sorted(set(target_versions))
+        except Exception:
+            # Table doesn't exist or query failed - treat as empty
+            target_versions = []
+
+        if source_versions != target_versions:
+            print("\n" + "=" * 70)
+            print("✗ Migration version mismatch detected!")
+            print("=" * 70)
+            print(
+                "\nThe source and target databases have different Alembic migration versions."
+            )
+            print(
+                "This indicates structural differences that must be resolved before migration.\n"
+            )
+            print(
+                f"Source version(s): {', '.join(source_versions) if source_versions else '(none)'}"
+            )
+            print(
+                f"Target version(s): {', '.join(target_versions) if target_versions else '(none)'}"
+            )
+            print(
+                "\nPlease ensure both databases are at the same migration state before proceeding."
+            )
+            print("=" * 70 + "\n")
+            sys.exit(1)
+
+        print(f"  ✓ Alembic version validated: {', '.join(source_versions)}")
 
     async def restart_sequences(self):
         """Restart PostgreSQL sequences and MySQL auto-increment after migration"""
@@ -1409,9 +1429,9 @@ class UniversalMigrator:
             # Connect and migrate
             await self.connect_target()
             await self.create_schema()  # Create schema for SQLite
+            await self.validate_alembic_version()  # Validate Alembic migration versions match
             await self.clear_data()
             await self.import_data()
-            await self.sync_alembic_version()  # Preserve Alembic revision metadata
             await self.restart_sequences()  # Restart sequences for PostgreSQL
             print("\n✓ Migration completed!")
             return True
