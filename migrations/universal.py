@@ -68,6 +68,12 @@ class UniversalMigrator:
         )
         self.truncate_strings = truncate_strings
         self.truncation_warnings = []  # Track truncated columns for reporting
+        self.migration_framework_tables = {
+            "alembic_version",
+            "django_migrations",
+            "flyway_schema_history",
+            "schema_migrations",
+        }
 
     def _get_default_table_order(self) -> list:
         """Get default table order (customizable via config file)"""
@@ -692,6 +698,10 @@ class UniversalMigrator:
 
                 # Truncate each table in its own transaction to avoid cascading failures
                 for table in tables:
+                    if table in self.migration_framework_tables:
+                        print(f"  ⊘ {table} (migration framework table - skipped)")
+                        continue
+
                     async with self.session_maker() as session:
                         try:
                             target_table = self._quote_identifier(
@@ -720,6 +730,10 @@ class UniversalMigrator:
             try:
                 # Clear each table in its own transaction to avoid cascading failures
                 for table in tables:
+                    if table in self.migration_framework_tables:
+                        print(f"  ⊘ {table} (migration framework table - skipped)")
+                        continue
+
                     try:
                         with self.target_engine.begin() as conn:
                             target_table = self._quote_identifier(
@@ -751,12 +765,7 @@ class UniversalMigrator:
                 continue
 
             # Skip migration framework tables (alembic_version, django_migrations, etc.)
-            if table in (
-                "alembic_version",
-                "django_migrations",
-                "flyway_schema_history",
-                "schema_migrations",
-            ):
+            if table in self.migration_framework_tables:
                 print(f"  ⊘ {table} (migration framework table - skipped)")
                 continue
 
